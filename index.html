@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Writer on Main, Readers in Workers</title>
+  <!-- I'm using https://github.com/gzuidhof/coi-serviceworker to implement
+    a service worker that will allow us to properly set COORS. You will
+    need to run a server with this. -->
+  <script src="./coi-serviceworker.js"></script>
+</head>
+<body>
+  <h1>Open DevTools Console to See Reader/Writer Output</h1>
+
+  <script>
+    // ensure that the cross origin isolation service worker is running:
+    const el = document.createElement("div")
+    el.innerHTML = `Cross origin isolated: ${window.crossOriginIsolated ? "✅" : "❌"}`
+    document.body.append(el);
+
+    // Reader/Writer pattern
+    // Shared data between workers and main thread.
+    // Two 32-bit slots: [0]=lock state, [1]=data payload
+    const sab = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+    const ia  = new Int32Array(sab);
+
+    const LOCK = 0; // this is the index
+    const DATA = 1; // this is the data being written
+
+    // Spawn 3 workers to act as "readers".
+    for (let i = 1; i <= 3; i++) {
+      const reader = new Worker('reader-worker.js');
+      reader.postMessage({ sab, id: i });
+    }
+
+    // ——— Asynchronous writer using waitAsync ———
+
+    // Async “acquire write” that waits only when state≠0
+    async function acquireWrite() {
+      while (true) {
+        // "state" is the test value we were discussing earlier
+        const state = Atomics.load(ia, LOCK);
+        // If nobody is currently reading, try to acquire the lock.
+        if (state === 0 &&
+            Atomics.compareExchange(ia, LOCK, 0, -1) === 0) {
+          return;
+        }
+        // Otherwise sleep until LOCK ≠ state (no CPU spin)
+        // This is the new feature, previously you would not be
+        // able to do this on the main thread.  You would have to
+        // do something worse, such as potentially blocking with
+        // a while loop, that would be bad. The user's experience
+        // of the website would be choppy.
+        await Atomics.waitAsync(ia, LOCK, state).value;
+        // on wake we just loop and re-test
+      }
+    }
+
+    function releaseWrite() {
+      Atomics.store(ia, LOCK, 0);
+      // wake ALL waiting readers
+      // Note: you can also notify just 1 reader, or 2, etc.
+      Atomics.notify(ia, LOCK, Infinity);
+    }
+
+    // Run the writer as an async task
+    (async () => {
+      for (let v = 1; v <= 5; v++) {
+        // Get the lock and ensure no readers read partial data
+        await acquireWrite();
+        // Write the data
+        ia[DATA] = v;
+        // Do work with the data
+        console.log(`[Writer] wrote ${v}`);
+        // release the lock to allow reading
+        releaseWrite();
+        // pause 500 ms between writes
+        await new Promise(r => setTimeout(r, 500));
+      }
+      console.log('[Writer] done');
+    })();
+  </script>
+</body>
+</html>
